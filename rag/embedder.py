@@ -18,9 +18,6 @@ Usage
     # later …
     store = embedder.load_store("vector_store")
 """
-import os
-
-os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.getenv("HF_TOKEN")
 from __future__ import annotations
 
 from pathlib import Path
