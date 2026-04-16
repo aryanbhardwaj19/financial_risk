@@ -36,15 +36,28 @@ def _env(key: str, default: str | None = None) -> str:
 class Settings:
     """Immutable application-wide settings."""
 
+    # ── LLM Provider ────────────────────────────────────────────────
+    LLM_PROVIDER: str = field(
+        default_factory=lambda: _env("LLM_PROVIDER", "groq"),
+    )
+
     # ── API keys ────────────────────────────────────────────────────
-    OPENAI_API_KEY: str = field(default_factory=lambda: _env("OPENAI_API_KEY"))
+    GOOGLE_API_KEY: str = field(
+        default_factory=lambda: os.getenv("GOOGLE_API_KEY", ""),
+    )
+    OPENAI_API_KEY: str = field(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY", ""),
+    )
+    GROQ_API_KEY: str = field(
+        default_factory=lambda: os.getenv("GROQ_API_KEY", ""),
+    )
 
     # ── Models ──────────────────────────────────────────────────────
     EMBEDDING_MODEL: str = field(
         default_factory=lambda: _env("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
     )
     LLM_MODEL: str = field(
-        default_factory=lambda: _env("LLM_MODEL", "gpt-4o"),
+        default_factory=lambda: _env("LLM_MODEL", "llama-3.3-70b-versatile"),
     )
 
     # ── Chunking ────────────────────────────────────────────────────

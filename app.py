@@ -1,27 +1,19 @@
 """
-Streamlit front-end for the Multi-Agent Financial Risk Analysis System.
+Streamlit front-end for FinRisk — AI Financial Document Q&A.
 
 Run with::
 
     streamlit run app.py
 
-Layout
-------
-- **Sidebar**: file uploader, query input, Run Analysis button, JSON export.
-- **Main area**: 4-tab output (Risk Report · Financial Metrics · Sources · Agent Trace).
-
-Session state is used to cache the FAISS vector store between queries so
-documents are only embedded once per upload batch.
+Uses a LangGraph multi-agent pipeline (Retriever → Analyzer →
+Reporter) to answer questions about uploaded financial documents.
 """
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
-from typing import List
 
-import pandas as pd
 import streamlit as st
 
 # ── Ensure project root is importable ───────────────────────────────
@@ -34,490 +26,555 @@ from ingestion.pdf_loader import load_pdf
 from ingestion.csv_loader import load_csv
 from rag.chunker import DocumentChunker
 from rag.embedder import DocumentEmbedder
-from graph.workflow import run_analysis
+from rag.qa import ask_question
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 # ── Page configuration ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="FinRisk · AI Financial Risk Analysis",
-    page_icon="✦",
+    page_title="FinRisk · AI Financial Intelligence",
+    page_icon="◆",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ──────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════
+# DESIGN SYSTEM — Premium Fintech Dark Theme
+# ═════════════════════════════════════════════════════════════════════
 st.markdown(
     """
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Instrument+Serif:ital@0;1&display=swap');
 
+    /* ═══════════════════ TOKEN SYSTEM ═══════════════════ */
     :root {
-        --bg: #0c0f1a;
-        --bg-alt: #111528;
-        --surface: rgba(255,255,255,0.04);
-        --surface-hover: rgba(255,255,255,0.07);
-        --surface-border: rgba(255,255,255,0.07);
-        --border: rgba(255,255,255,0.08);
-        --text: #eee;
-        --text-secondary: #9ca3af;
-        --text-muted: #6b7280;
-        --accent: #818cf8;
-        --accent-2: #a78bfa;
-        --accent-3: #c084fc;
-        --gradient: linear-gradient(135deg, #818cf8, #a78bfa, #c084fc);
-        --success: #34d399;
-        --warning: #fbbf24;
-        --danger: #f87171;
+        --bg-primary:   #0D1117;
+        --bg-surface:   #161B22;
+        --bg-elevated:  #1C2128;
+        --bg-overlay:   rgba(22,27,34,0.85);
+        --border:       rgba(139,148,158,0.12);
+        --border-subtle:rgba(139,148,158,0.08);
+        --border-accent:rgba(99,102,241,0.25);
+
+        --text-primary: #E6EDF3;
+        --text-body:    #C9D1D9;
+        --text-muted:   #8B949E;
+        --text-faint:   #484F58;
+
+        --accent:       #6366F1;
+        --accent-light: #818CF8;
+        --accent-glow:  rgba(99,102,241,0.15);
+        --teal:         #10B981;
+        --teal-glow:    rgba(16,185,129,0.12);
+        --amber:        #F59E0B;
+        --amber-glow:   rgba(245,158,11,0.12);
+        --purple:       #A78BFA;
+        --purple-glow:  rgba(167,139,250,0.12);
+        --red:          #F87171;
+        --red-glow:     rgba(248,113,113,0.12);
+
+        --gradient-brand: linear-gradient(135deg, #6366F1 0%, #818CF8 50%, #A78BFA 100%);
+        --gradient-subtle:linear-gradient(180deg, rgba(99,102,241,0.06) 0%, transparent 100%);
+
+        --radius-sm: 6px;
+        --radius-md: 10px;
+        --radius-lg: 14px;
+        --radius-xl: 20px;
+        --radius-pill: 50px;
+
+        --shadow-sm: 0 1px 3px rgba(0,0,0,0.3);
+        --shadow-md: 0 4px 16px rgba(0,0,0,0.4);
+        --shadow-lg: 0 8px 32px rgba(0,0,0,0.5);
+        --shadow-glow: 0 0 30px rgba(99,102,241,0.15);
+
+        --transition: 180ms cubic-bezier(0.4,0,0.2,1);
     }
 
-    /* ── Global ─────────────────────────────────────────────────── */
+    /* ═══════════════════ GLOBAL ═══════════════════ */
     .stApp {
-        font-family: 'Inter', sans-serif !important;
-        background: var(--bg) !important;
-        color: var(--text) !important;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+        background: var(--bg-primary) !important;
+        color: var(--text-body) !important;
     }
     .stApp > header { background: transparent !important; }
 
     .main .block-container {
-        padding: 1rem 2rem 2rem !important;
+        padding: 0 2.5rem 2rem !important;
         max-width: 100% !important;
     }
 
     .stApp, .stApp p, .stApp span, .stApp div, .stApp li, .stApp label,
     .stApp input, .stApp textarea, .stApp button {
-        font-family: 'Inter', sans-serif !important;
+        font-family: 'Inter', -apple-system, sans-serif !important;
     }
 
+    /* ── Typography Scale ───────────────────────────────── */
     h1 {
-        font-weight: 700 !important;
-        font-size: 1.5rem !important;
-        letter-spacing: -0.03em !important;
-        color: #fff !important;
-        background: none !important;
-        -webkit-text-fill-color: #fff !important;
+        font-weight: 700 !important; font-size: 1.5rem !important;
+        letter-spacing: -0.03em !important; color: var(--text-primary) !important;
+        background: none !important; -webkit-text-fill-color: var(--text-primary) !important;
     }
-    h2 {
-        font-weight: 600 !important;
-        font-size: 1.1rem !important;
-        color: #fff !important;
-    }
-    h3 {
-        font-weight: 600 !important;
-        font-size: 0.95rem !important;
-        color: #fff !important;
-    }
+    h2 { font-weight: 600 !important; font-size: 1.15rem !important; color: var(--text-primary) !important; }
+    h3 { font-weight: 600 !important; font-size: 0.95rem !important; color: var(--text-primary) !important; }
     p, li {
-        color: var(--text-secondary) !important;
-        line-height: 1.65 !important;
-        font-size: 0.88rem !important;
+        color: var(--text-body) !important; line-height: 1.7 !important;
+        font-size: 0.875rem !important;
     }
 
-    /* ── Sidebar ────────────────────────────────────────────────── */
+    /* ═══════════════════ SIDEBAR ═══════════════════ */
     [data-testid="stSidebar"] {
-        background: #0a0d17 !important;
+        background: #0B0F19 !important;
         border-right: 1px solid var(--border) !important;
     }
     [data-testid="stSidebar"] h1,
     [data-testid="stSidebar"] h2 {
-        font-size: 0.72rem !important;
-        text-transform: uppercase !important;
-        letter-spacing: 0.12em !important;
-        font-weight: 600 !important;
+        font-size: 0.68rem !important; text-transform: uppercase !important;
+        letter-spacing: 0.12em !important; font-weight: 600 !important;
         color: var(--text-muted) !important;
         -webkit-text-fill-color: var(--text-muted) !important;
     }
 
-    /* ── File uploader ──────────────────────────────────────────── */
+    /* ── File uploader ──────────────────────────────────── */
     [data-testid="stFileUploader"] {
-        background: var(--surface) !important;
-        border: 1px dashed rgba(129,140,248,0.25) !important;
-        border-radius: 10px !important;
-        transition: all 0.25s ease !important;
+        background: rgba(99,102,241,0.04) !important;
+        border: 1.5px dashed var(--border-accent) !important;
+        border-radius: var(--radius-lg) !important;
+        transition: all var(--transition) !important;
     }
     [data-testid="stFileUploader"]:hover {
         border-color: var(--accent) !important;
-        background: rgba(129,140,248,0.05) !important;
+        background: var(--accent-glow) !important;
+        box-shadow: var(--shadow-glow) !important;
     }
-    [data-testid="stFileUploader"] label { color: var(--text-secondary) !important; font-size: 0.82rem !important; }
+    [data-testid="stFileUploader"] label {
+        color: var(--text-body) !important; font-size: 0.8rem !important;
+    }
     [data-testid="stFileUploader"] small { color: var(--text-muted) !important; }
 
-    /* ── Buttons ────────────────────────────────────────────────── */
+    /* ── Buttons ─────────────────────────────────────────── */
     .stButton > button {
-        background: var(--gradient) !important;
-        color: #fff !important;
-        border: none !important;
-        border-radius: 8px !important;
-        font-weight: 600 !important;
-        font-size: 0.85rem !important;
-        padding: 0.55rem 1.2rem !important;
-        transition: all 0.25s ease !important;
-        box-shadow: 0 4px 20px rgba(129,140,248,0.25) !important;
+        background: var(--gradient-brand) !important; color: #fff !important;
+        border: none !important; border-radius: var(--radius-md) !important;
+        font-weight: 600 !important; font-size: 0.85rem !important;
+        padding: 0.6rem 1.4rem !important;
+        transition: all var(--transition) !important;
+        box-shadow: 0 2px 12px rgba(99,102,241,0.3) !important;
     }
-    .stButton > button p,
-    .stButton > button span,
-    .stButton > button div {
-        color: #fff !important;
-        -webkit-text-fill-color: #fff !important;
+    .stButton > button p, .stButton > button span, .stButton > button div {
+        color: #fff !important; -webkit-text-fill-color: #fff !important;
     }
     .stButton > button:hover {
         transform: translateY(-1px) !important;
-        box-shadow: 0 6px 25px rgba(129,140,248,0.35) !important;
+        box-shadow: 0 6px 24px rgba(99,102,241,0.4) !important;
     }
     .stButton > button:disabled {
-        background: rgba(255,255,255,0.06) !important;
-        color: var(--text-muted) !important;
-        box-shadow: none !important;
+        background: var(--bg-elevated) !important;
+        color: var(--text-faint) !important; box-shadow: none !important;
     }
-    .stButton > button:disabled p,
-    .stButton > button:disabled span,
-    .stButton > button:disabled div {
-        color: var(--text-muted) !important;
-        -webkit-text-fill-color: var(--text-muted) !important;
-    }
-    .stDownloadButton > button {
-        background: rgba(52,211,153,0.1) !important;
-        color: var(--success) !important;
-        border: 1px solid rgba(52,211,153,0.2) !important;
-        box-shadow: none !important;
-    }
-    .stDownloadButton > button p,
-    .stDownloadButton > button span {
-        color: var(--success) !important;
-        -webkit-text-fill-color: var(--success) !important;
-    }
-    .stDownloadButton > button:hover {
-        background: rgba(52,211,153,0.2) !important;
+    .stButton > button:disabled p, .stButton > button:disabled span {
+        color: var(--text-faint) !important; -webkit-text-fill-color: var(--text-faint) !important;
     }
 
-    /* ── Text area ──────────────────────────────────────────────── */
+    /* ── Text area ──────────────────────────────────────── */
     .stTextArea textarea {
-        background: var(--surface) !important;
+        background: var(--bg-surface) !important;
         border: 1px solid var(--border) !important;
-        border-radius: 8px !important;
-        color: var(--text) !important;
-        font-size: 0.88rem !important;
-        transition: border-color 0.2s ease !important;
+        border-radius: var(--radius-md) !important;
+        color: var(--text-primary) !important;
+        font-size: 0.875rem !important;
+        transition: all var(--transition) !important;
     }
     .stTextArea textarea:focus {
         border-color: var(--accent) !important;
-        box-shadow: 0 0 0 3px rgba(129,140,248,0.15) !important;
+        box-shadow: 0 0 0 3px var(--accent-glow) !important;
     }
-    .stTextArea textarea::placeholder { color: var(--text-muted) !important; }
+    .stTextArea textarea::placeholder { color: var(--text-faint) !important; }
 
-    /* ── Tabs ───────────────────────────────────────────────────── */
-    .stTabs [data-baseweb="tab-list"] {
-        background: var(--surface) !important;
-        border-radius: 10px !important;
-        padding: 4px !important;
-        border: 1px solid var(--border) !important;
-        gap: 4px !important;
-    }
-    .stTabs [data-baseweb="tab"] {
-        background: transparent !important;
-        color: var(--text-muted) !important;
-        border-radius: 7px !important;
-        font-weight: 500 !important;
-        font-size: 0.82rem !important;
-        padding: 0.45rem 0.9rem !important;
-        border: none !important;
-        transition: all 0.2s ease !important;
-    }
-    .stTabs [data-baseweb="tab"] p,
-    .stTabs [data-baseweb="tab"] span {
-        color: var(--text-muted) !important;
-        -webkit-text-fill-color: var(--text-muted) !important;
-    }
-    .stTabs [aria-selected="true"] {
-        background: var(--gradient) !important;
-        color: #fff !important;
-        font-weight: 600 !important;
-    }
-    .stTabs [aria-selected="true"] p,
-    .stTabs [aria-selected="true"] span {
-        color: #fff !important;
-        -webkit-text-fill-color: #fff !important;
-    }
-    .stTabs [data-baseweb="tab-highlight"],
-    .stTabs [data-baseweb="tab-border"] { display: none !important; }
-
-    /* ── DataFrames ─────────────────────────────────────────────── */
-    [data-testid="stDataFrame"] {
-        border-radius: 10px !important;
-        border: 1px solid var(--border) !important;
-        overflow: hidden !important;
-    }
-
-    /* ── Expanders ──────────────────────────────────────────────── */
+    /* ── Expanders ──────────────────────────────────────── */
     details {
         border: 1px solid var(--border) !important;
-        border-radius: 8px !important;
-        background: var(--surface) !important;
+        border-radius: var(--radius-md) !important;
+        background: var(--bg-surface) !important;
     }
-    details summary { font-weight: 500 !important; color: var(--text) !important; font-size: 0.85rem !important; }
-
-    /* ── Alerts ─────────────────────────────────────────────────── */
-    .stAlert, [data-testid="stAlert"] { border-radius: 8px !important; border: none !important; }
-
-    /* ── Divider ────────────────────────────────────────────────── */
-    hr { border-color: var(--border) !important; margin: 1.25rem 0 !important; }
-
-    /* ── Metrics ────────────────────────────────────────────────── */
-    [data-testid="stMetric"] {
-        background: var(--surface) !important;
-        border: 1px solid var(--border) !important;
-        border-radius: 10px !important;
-        padding: 0.85rem 1rem !important;
+    details summary {
+        font-weight: 500 !important; color: var(--text-primary) !important;
+        font-size: 0.82rem !important;
     }
-    [data-testid="stMetricValue"] { color: var(--accent) !important; font-weight: 700 !important; }
-    [data-testid="stMetricLabel"] { color: var(--text-muted) !important; font-size: 0.72rem !important; text-transform: uppercase !important; letter-spacing: 0.05em !important; }
 
-    /* ── Caption ────────────────────────────────────────────────── */
+    .stAlert, [data-testid="stAlert"] { border-radius: var(--radius-md) !important; border: none !important; }
+    hr { border-color: var(--border-subtle) !important; margin: 1rem 0 !important; }
     .stCaption, [data-testid="stCaption"] { color: var(--text-muted) !important; font-size: 0.72rem !important; }
 
-    /* ── Scrollbar ──────────────────────────────────────────────── */
-    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    /* ── Scrollbar ──────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(129,140,248,0.2); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
 
-    /* ═══════════════════════════════════════════════════════════════
-       RISK BADGES
-       ═══════════════════════════════════════════════════════════════ */
-    .risk-badge {
-        display: inline-block;
-        padding: 0.4rem 1.2rem;
-        border-radius: 50px;
-        font-size: 0.78rem;
-        font-weight: 600;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        margin-bottom: 1.25rem;
-    }
-    .risk-LOW      { background: rgba(52,211,153,0.12); color: #34d399; border: 1px solid rgba(52,211,153,0.25); }
-    .risk-MEDIUM   { background: rgba(251,191,36,0.12); color: #fbbf24; border: 1px solid rgba(251,191,36,0.25); }
-    .risk-HIGH     { background: rgba(248,113,113,0.12); color: #f87171; border: 1px solid rgba(248,113,113,0.25); }
-    .risk-CRITICAL { background: rgba(248,113,113,0.2); color: #fca5a5; border: 1px solid rgba(248,113,113,0.3); }
-    .risk-UNKNOWN  { background: var(--surface); color: var(--text-muted); border: 1px solid var(--border); }
-
-    /* ═══════════════════════════════════════════════════════════════
-       AGENT TRACE
-       ═══════════════════════════════════════════════════════════════ */
-    .trace-step {
+    /* ═══════════════════ SIDEBAR BRAND ═══════════════════ */
+    .sidebar-brand {
         display: flex; align-items: center; gap: 0.65rem;
-        padding: 0.5rem 0.65rem; border-radius: 6px;
-        font-size: 0.85rem; color: var(--text);
-        transition: background 0.15s ease; margin-bottom: 2px;
+        padding: 0.3rem 0 1.1rem; margin-bottom: 0.6rem;
+        border-bottom: 1px solid var(--border);
     }
-    .trace-step:hover { background: var(--surface); }
-    .trace-dot {
-        width: 8px; height: 8px; border-radius: 50%;
-        background: var(--gradient); flex-shrink: 0;
+    .brand-mark {
+        width: 34px; height: 34px; border-radius: 8px;
+        background: var(--gradient-brand);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 1rem; color: #fff; font-weight: 800;
+        box-shadow: 0 2px 10px rgba(99,102,241,0.3);
+    }
+    .brand-text { font-size: 0.95rem; font-weight: 700; color: var(--text-primary); letter-spacing: -0.02em; }
+    .brand-tagline { font-size: 0.6rem; color: var(--text-muted); letter-spacing: 0.04em; margin-top: 1px; }
+
+    /* ── Sidebar sections ──────────────────────────────── */
+    .sb-section-title {
+        font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.12em;
+        color: var(--text-faint); font-weight: 700; margin: 1rem 0 0.5rem;
+        display: flex; align-items: center; gap: 0.4rem;
+    }
+    .sb-section-title svg { width: 12px; height: 12px; opacity: 0.6; }
+
+    /* ── Config chips ──────────────────────────────────── */
+    .config-grid {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem;
+    }
+    .config-chip {
+        background: var(--bg-surface); border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm); padding: 0.4rem 0.55rem;
+        transition: all var(--transition);
+    }
+    .config-chip:hover { border-color: var(--border-accent); background: var(--accent-glow); }
+    .config-chip .chip-label {
+        font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.08em;
+        color: var(--text-faint); font-weight: 600; margin-bottom: 2px;
+    }
+    .config-chip .chip-value {
+        font-size: 0.72rem; color: var(--accent-light); font-weight: 600;
+        font-family: 'SF Mono', 'Consolas', monospace;
     }
 
-    /* ═══════════════════════════════════════════════════════════════
-       SECTION HEADER
-       ═══════════════════════════════════════════════════════════════ */
-    .sh { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.85rem; padding-bottom: 0.55rem; border-bottom: 1px solid var(--border); }
-    .sh-icon { font-size: 0.95rem; }
-    .sh-title { font-size: 0.9rem; font-weight: 600; color: #fff; margin: 0; }
+    /* ── Upload status ─────────────────────────────────── */
+    .upload-status {
+        display: flex; align-items: center; gap: 0.45rem;
+        padding: 0.55rem 0.7rem; border-radius: var(--radius-md);
+        font-size: 0.78rem; font-weight: 500; margin: 0.5rem 0;
+    }
+    .upload-status.success { background: var(--teal-glow); color: var(--teal); border: 1px solid rgba(16,185,129,0.2); }
+    .upload-status.error  { background: var(--red-glow); color: var(--red); border: 1px solid rgba(248,113,113,0.2); }
+    .upload-status.warning { background: var(--amber-glow); color: var(--amber); border: 1px solid rgba(245,158,11,0.2); }
 
-    /* ═══════════════════════════════════════════════════════════════
-       HERO LANDING
-       ═══════════════════════════════════════════════════════════════ */
-
-    /* Background glow effects */
-    .bg-glow {
+    /* ═══════════════════ HERO SECTION ═══════════════════ */
+    .hero-bg {
         position: fixed; top: 0; left: 0; right: 0; bottom: 0;
         pointer-events: none; z-index: 0; overflow: hidden;
+        background:
+            radial-gradient(ellipse 800px 600px at 70% 10%, rgba(99,102,241,0.08), transparent),
+            radial-gradient(ellipse 600px 500px at 20% 80%, rgba(167,139,250,0.06), transparent),
+            radial-gradient(ellipse 500px 400px at 50% 50%, rgba(16,185,129,0.04), transparent);
     }
-    .bg-glow .orb {
-        position: absolute; border-radius: 50%; filter: blur(100px); opacity: 0.12;
-    }
-    .bg-glow .orb-1 { width: 600px; height: 600px; background: #818cf8; top: -200px; right: -100px; animation: orbFloat 20s ease-in-out infinite; }
-    .bg-glow .orb-2 { width: 500px; height: 500px; background: #c084fc; bottom: -150px; left: -100px; animation: orbFloat 25s ease-in-out infinite reverse; }
-    .bg-glow .orb-3 { width: 400px; height: 400px; background: #818cf8; top: 40%; left: 50%; animation: orbFloat 18s ease-in-out infinite 5s; }
-    @keyframes orbFloat {
-        0%, 100% { transform: translate(0, 0); }
-        33% { transform: translate(30px, -30px); }
-        66% { transform: translate(-20px, 20px); }
+    .hero-bg::before {
+        content: ''; position: absolute; inset: 0;
+        background: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+        background-size: 200px; opacity: 0.4;
     }
 
-    .hero-wrapper {
-        position: relative; z-index: 1;
-    }
+    .hero-wrapper { position: relative; z-index: 1; }
 
-    /* Top bar */
-    .top-bar {
+    /* Hero top bar */
+    .hero-topbar {
         display: flex; justify-content: space-between; align-items: center;
-        padding: 0.5rem 0 1.5rem;
+        padding: 0 0 1.25rem;
     }
-    .top-logo {
-        display: flex; align-items: center; gap: 0.5rem;
-        font-size: 1.1rem; font-weight: 700; color: #fff;
+    .hero-logo {
+        display: flex; align-items: center; gap: 0.6rem;
     }
-    .top-logo span { background: var(--gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 1.3rem; }
-    .top-badge {
-        font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em;
-        color: var(--accent); background: rgba(129,140,248,0.1);
-        padding: 0.3rem 0.7rem; border-radius: 50px;
-        border: 1px solid rgba(129,140,248,0.2); font-weight: 600;
+    .hero-logo-mark {
+        width: 36px; height: 36px; border-radius: 9px;
+        background: var(--gradient-brand);
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; color: #fff; font-size: 0.95rem;
+        box-shadow: 0 2px 12px rgba(99,102,241,0.35);
+    }
+    .hero-logo-text { font-size: 1.1rem; font-weight: 700; color: var(--text-primary); letter-spacing: -0.02em; }
+    .hero-tag {
+        font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.1em;
+        color: var(--accent-light); background: var(--accent-glow);
+        padding: 0.3rem 0.75rem; border-radius: var(--radius-pill);
+        border: 1px solid var(--border-accent); font-weight: 600;
     }
 
-    /* Hero text */
-    .hero-center {
-        text-align: center; padding: 2rem 0 2.5rem;
+    /* Hero center */
+    .hero-center { text-align: center; padding: 1.5rem 0 1rem; }
+    .hero-eyebrow {
+        font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.15em;
+        color: var(--accent-light); font-weight: 600; margin-bottom: 0.75rem;
     }
     .hero-title {
         font-family: 'Instrument Serif', Georgia, serif !important;
-        font-size: 3.2rem !important; font-weight: 400 !important; font-style: italic;
-        color: #fff !important; -webkit-text-fill-color: #fff !important;
-        background: none !important;
-        margin-bottom: 0.6rem !important; line-height: 1.1 !important;
+        font-size: 3rem !important; font-weight: 400 !important; font-style: italic;
+        color: var(--text-primary) !important; -webkit-text-fill-color: var(--text-primary) !important;
+        background: none !important; margin-bottom: 0.85rem !important;
+        line-height: 1.1 !important; letter-spacing: -0.02em !important;
     }
     .hero-sub {
-        color: var(--text-muted); font-size: 1rem; max-width: 550px;
-        margin: 0 auto; line-height: 1.65;
+        color: var(--text-muted); font-size: 1rem; max-width: 520px;
+        margin: 0 auto; line-height: 1.7;
+    }
+    .hero-trust {
+        display: flex; justify-content: center; gap: 1.5rem;
+        margin-top: 1.25rem; flex-wrap: wrap;
+    }
+    .hero-trust span {
+        font-size: 0.7rem; color: var(--text-faint); font-weight: 500;
+        display: flex; align-items: center; gap: 0.3rem;
+    }
+    .hero-trust .dot { width: 4px; height: 4px; border-radius: 50%; background: var(--accent); }
+
+    /* ── Stat cards ──────────────────────────────────────── */
+    .stat-grid {
+        display: grid; grid-template-columns: repeat(4,1fr); gap: 0.85rem;
+        padding: 2rem 0 2.5rem; max-width: 700px; margin: 0 auto;
+    }
+    .stat-card {
+        background: var(--bg-surface); border: 1px solid var(--border);
+        border-radius: var(--radius-lg); padding: 1rem 0.85rem;
+        text-align: center; transition: all var(--transition);
+    }
+    .stat-card:hover {
+        border-color: var(--border-accent); transform: translateY(-2px);
+        box-shadow: var(--shadow-glow);
+    }
+    .stat-icon { font-size: 1.3rem; margin-bottom: 0.4rem; }
+    .stat-val {
+        font-size: 1.35rem; font-weight: 800; letter-spacing: -0.03em;
+        background: var(--gradient-brand); -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .stat-desc {
+        font-size: 0.65rem; color: var(--text-muted); margin-top: 0.2rem;
+        line-height: 1.4; text-transform: uppercase; letter-spacing: 0.06em;
     }
 
-    /* Stats row */
-    .stats-row {
-        display: flex; justify-content: center; gap: 3rem;
-        padding: 1.5rem 0 2.5rem;
-    }
-    .stat-item { text-align: center; }
-    .stat-value {
-        font-size: 1.6rem; font-weight: 800; letter-spacing: -0.03em;
-        background: var(--gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    }
-    .stat-label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.1em; margin-top: 0.2rem; }
-
-    /* Steps row */
-    .steps-row {
-        display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;
-        margin-bottom: 1.5rem;
-    }
+    /* ── How it works cards ──────────────────────────────── */
+    .steps-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 0.85rem; margin-bottom: 1.5rem; }
     .step-card {
-        background: var(--surface); border: 1px solid var(--surface-border);
-        border-radius: 12px; padding: 1.5rem; text-align: left;
-        transition: all 0.25s ease; position: relative; overflow: hidden;
+        background: var(--bg-surface); border: 1px solid var(--border);
+        border-left: 3px solid var(--accent);
+        border-radius: var(--radius-lg); padding: 1.35rem;
+        transition: all var(--transition); position: relative; overflow: hidden;
     }
-    .step-card::after {
-        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
-        background: var(--gradient); opacity: 0; transition: opacity 0.25s ease;
+    .step-card:hover {
+        border-color: var(--border-accent);
+        background: var(--bg-elevated); transform: translateY(-2px);
+        box-shadow: var(--shadow-md);
     }
-    .step-card:hover { background: var(--surface-hover); border-color: rgba(129,140,248,0.15); transform: translateY(-2px); }
-    .step-card:hover::after { opacity: 1; }
-    .step-num {
+    .step-badge {
         display: inline-flex; align-items: center; justify-content: center;
-        width: 30px; height: 30px; border-radius: 8px;
-        background: var(--gradient); color: #fff; font-weight: 700;
-        font-size: 0.78rem; margin-bottom: 0.85rem;
+        width: 28px; height: 28px; border-radius: 7px;
+        background: var(--accent-glow); border: 1px solid var(--border-accent);
+        color: var(--accent-light); font-weight: 700; font-size: 0.75rem;
+        margin-bottom: 0.75rem;
     }
-    .step-title { color: #fff; font-weight: 600; font-size: 0.92rem; margin-bottom: 0.3rem; }
-    .step-desc { color: var(--text-muted); font-size: 0.8rem; line-height: 1.5; }
-
-    /* Pipeline + Features grid */
-    .bottom-grid {
-        display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;
-    }
-
-    .card-block {
-        background: var(--surface); border: 1px solid var(--surface-border);
-        border-radius: 12px; padding: 1.25rem; overflow: hidden;
-    }
-    .card-header {
-        font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em;
-        color: var(--text-muted); font-weight: 600; margin-bottom: 1rem;
-        padding-bottom: 0.6rem; border-bottom: 1px solid var(--border);
-    }
-
-    /* Pipeline items */
-    .pipe-list { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
-    .pipe-item {
-        display: flex; align-items: center; gap: 0.55rem;
-        padding: 0.55rem 0.65rem; border-radius: 8px; font-size: 0.82rem;
-        color: var(--text-secondary); transition: background 0.15s ease;
-    }
-    .pipe-item:hover { background: rgba(255,255,255,0.03); }
-    .pipe-icon {
-        width: 28px; height: 28px; border-radius: 6px;
+    .step-icon {
+        width: 32px; height: 32px; border-radius: 8px; margin-bottom: 0.75rem;
         display: flex; align-items: center; justify-content: center;
-        font-size: 0.85rem; flex-shrink: 0;
+        font-size: 1rem;
     }
-    .pipe-icon.p1 { background: rgba(129,140,248,0.12); }
-    .pipe-icon.p2 { background: rgba(52,211,153,0.12); }
-    .pipe-icon.p3 { background: rgba(251,191,36,0.12); }
-    .pipe-icon.p4 { background: rgba(248,113,113,0.12); }
-    .pipe-icon.p5 { background: rgba(167,139,250,0.12); }
-    .pipe-icon.p6 { background: rgba(192,132,252,0.12); }
-    .pipe-name { font-weight: 600; color: #fff; font-size: 0.82rem; }
-    .pipe-desc { color: var(--text-muted); font-size: 0.72rem; }
+    .step-icon.si-1 { background: var(--accent-glow); }
+    .step-icon.si-2 { background: var(--teal-glow); }
+    .step-icon.si-3 { background: var(--amber-glow); }
+    .step-title { color: var(--text-primary); font-weight: 600; font-size: 0.88rem; margin-bottom: 0.3rem; }
+    .step-desc { color: var(--text-muted); font-size: 0.78rem; line-height: 1.55; }
 
-    /* Feature items */
-    .feat-list { display: flex; flex-direction: column; gap: 0.65rem; }
-    .feat-item {
-        display: flex; align-items: flex-start; gap: 0.65rem;
-        padding: 0.55rem 0.65rem; border-radius: 8px;
-        transition: background 0.15s ease;
+    /* ── Agent pipeline ─────────────────────────────────── */
+    .pipeline-section {
+        background: var(--bg-surface); border: 1px solid var(--border);
+        border-radius: var(--radius-xl); padding: 1.5rem;
+        margin-bottom: 1.5rem; position: relative; overflow: hidden;
     }
-    .feat-item:hover { background: rgba(255,255,255,0.03); }
-    .feat-dot {
-        width: 6px; height: 6px; border-radius: 50%; margin-top: 6px;
-        flex-shrink: 0;
+    .pipeline-section::before {
+        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+        background: var(--gradient-brand);
     }
-    .feat-dot.d1 { background: var(--accent); }
-    .feat-dot.d2 { background: var(--accent-2); }
-    .feat-dot.d3 { background: var(--accent-3); }
-    .feat-dot.d4 { background: var(--success); }
-    .feat-name { font-weight: 600; color: #fff; font-size: 0.82rem; }
-    .feat-desc { color: var(--text-muted); font-size: 0.75rem; line-height: 1.45; }
+    .pipeline-header {
+        font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.12em;
+        color: var(--text-faint); font-weight: 700; margin-bottom: 1.25rem;
+        text-align: center;
+    }
+    .pipeline-row {
+        display: flex; justify-content: center; align-items: stretch;
+        gap: 0.5rem; flex-wrap: wrap;
+    }
+    .agent-card {
+        flex: 1; max-width: 200px; padding: 0.85rem; border-radius: var(--radius-md);
+        text-align: center; transition: all var(--transition);
+        position: relative; overflow: hidden;
+    }
+    .agent-card::before {
+        content: ''; position: absolute; inset: 0; border-radius: var(--radius-md);
+        padding: 1px; background: var(--gradient-brand); mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+        mask-composite: exclude; -webkit-mask-composite: xor; opacity: 0;
+        transition: opacity var(--transition);
+    }
+    .agent-card:hover::before { opacity: 1; }
+    .agent-card.ag-retriever { background: rgba(16,185,129,0.06); border: 1px solid rgba(16,185,129,0.12); }
+    .agent-card.ag-analyzer  { background: rgba(245,158,11,0.06); border: 1px solid rgba(245,158,11,0.12); }
+    .agent-card.ag-reporter  { background: rgba(167,139,250,0.06); border: 1px solid rgba(167,139,250,0.12); }
+    .agent-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-sm); }
+    .agent-icon { font-size: 1.2rem; margin-bottom: 0.35rem; }
+    .agent-name { font-size: 0.78rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.2rem; }
+    .agent-role { font-size: 0.67rem; color: var(--text-muted); line-height: 1.45; }
+    .agent-name.an-retriever { color: var(--teal); }
+    .agent-name.an-analyzer  { color: var(--amber); }
+    .agent-name.an-reporter  { color: var(--purple); }
+    .pipeline-arrow {
+        display: flex; align-items: center; color: var(--text-faint);
+        font-size: 1.1rem; padding: 0 0.15rem;
+    }
 
-    /* Supported formats bar */
-    .formats-bar {
+    /* ── File format chips ──────────────────────────────── */
+    .format-bar {
         display: flex; justify-content: center; gap: 0.5rem;
-        padding: 1.25rem 0 0.5rem; flex-wrap: wrap;
+        padding: 0.5rem 0 0; flex-wrap: wrap;
     }
-    .format-tag {
-        font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
-        letter-spacing: 0.06em; color: var(--text-muted);
-        background: var(--surface); border: 1px solid var(--border);
-        padding: 0.3rem 0.65rem; border-radius: 5px;
+    .fmt-chip {
+        display: inline-flex; align-items: center; gap: 0.3rem;
+        padding: 0.3rem 0.7rem; border-radius: var(--radius-sm);
+        font-size: 0.68rem; font-weight: 600; letter-spacing: 0.05em;
+        transition: all var(--transition);
     }
+    .fmt-chip:hover { transform: translateY(-1px); }
+    .fmt-chip.fc-pdf  { background: rgba(248,113,113,0.08); color: #F87171; border: 1px solid rgba(248,113,113,0.15); }
+    .fmt-chip.fc-csv  { background: var(--teal-glow); color: var(--teal); border: 1px solid rgba(16,185,129,0.15); }
+    .fmt-chip.fc-xls  { background: var(--accent-glow); color: var(--accent-light); border: 1px solid var(--border-accent); }
+    .fmt-chip .fmt-icon { font-size: 0.8rem; }
 
-    /* ── Sidebar extras ────────────────────────────────────────── */
-    .sidebar-brand {
+    /* ═══════════════════ Q&A INTERFACE ═══════════════════ */
+    .qa-topbar {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 0 0 0.75rem; margin-bottom: 0.75rem;
+        border-bottom: 1px solid var(--border-subtle);
+    }
+    .qa-logo {
         display: flex; align-items: center; gap: 0.55rem;
-        padding: 0.25rem 0 1rem; margin-bottom: 0.5rem;
-        border-bottom: 1px solid var(--border);
     }
-    .brand-logo { font-size: 1.3rem; background: var(--gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .brand-text { font-size: 0.92rem; font-weight: 700; color: #fff; }
-    .brand-sub { font-size: 0.62rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.1em; }
+    .qa-logo-mark {
+        width: 30px; height: 30px; border-radius: 7px;
+        background: var(--gradient-brand);
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 800; color: #fff; font-size: 0.8rem;
+    }
+    .qa-logo-text { font-size: 0.95rem; font-weight: 700; color: var(--text-primary); }
+    .qa-badge {
+        font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em;
+        color: var(--teal); background: var(--teal-glow);
+        padding: 0.25rem 0.6rem; border-radius: var(--radius-pill);
+        border: 1px solid rgba(16,185,129,0.2); font-weight: 600;
+    }
 
-    .upload-status {
-        display: flex; align-items: center; gap: 0.4rem;
-        padding: 0.5rem 0.65rem; border-radius: 6px;
-        font-size: 0.78rem; font-weight: 500; margin: 0.5rem 0;
+    /* ── Chat bubbles ──────────────────────────────────── */
+    .q-bubble {
+        background: var(--accent-glow); border: 1px solid var(--border-accent);
+        border-radius: var(--radius-lg); padding: 0.8rem 1.15rem;
+        margin-bottom: 0.65rem; display: flex; align-items: flex-start; gap: 0.55rem;
     }
-    .upload-status.success { background: rgba(52,211,153,0.1); color: var(--success); border: 1px solid rgba(52,211,153,0.2); }
-    .upload-status.error { background: rgba(248,113,113,0.1); color: var(--danger); border: 1px solid rgba(248,113,113,0.2); }
-    .upload-status.warning { background: rgba(251,191,36,0.1); color: var(--warning); border: 1px solid rgba(251,191,36,0.2); }
+    .q-bubble .q-icon {
+        width: 24px; height: 24px; border-radius: 6px;
+        background: var(--gradient-brand); display: flex; align-items: center;
+        justify-content: center; font-size: 0.7rem; color: #fff;
+        flex-shrink: 0; margin-top: 1px;
+    }
+    .q-bubble .q-text {
+        color: var(--accent-light) !important; font-size: 0.88rem !important;
+        font-weight: 500; line-height: 1.55 !important;
+    }
 
-    .settings-card {
-        background: var(--surface); border: 1px solid var(--border);
-        border-radius: 8px; padding: 0.65rem 0.75rem;
-        font-size: 0.72rem; color: var(--text-muted); line-height: 1.9;
+    .a-card {
+        background: var(--bg-surface); border: 1px solid var(--border);
+        border-radius: var(--radius-lg); padding: 1.4rem 1.6rem; margin-bottom: 0.5rem;
+        border-left: 3px solid var(--accent);
     }
-    .settings-card code {
-        background: rgba(129,140,248,0.1); color: var(--accent);
-        padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.68rem;
+    .a-card p, .a-card li {
+        color: var(--text-body) !important; font-size: 0.88rem !important;
+        line-height: 1.8 !important;
     }
-    .settings-label {
-        font-weight: 600; color: var(--text-secondary);
-        font-size: 0.65rem; text-transform: uppercase;
-        letter-spacing: 0.08em; margin-bottom: 0.2rem;
+    .a-card strong, .a-card b { color: var(--text-primary) !important; }
+    .a-card h1, .a-card h2, .a-card h3 {
+        font-size: 0.95rem !important; margin-top: 0.8rem !important;
+        color: var(--text-primary) !important;
     }
+    .a-card code {
+        background: var(--bg-elevated); padding: 0.1rem 0.35rem;
+        border-radius: 4px; font-size: 0.8rem; color: var(--accent-light);
+    }
+
+    /* ── Agent trace ──────────────────────────────────── */
+    .trace-bar {
+        display: flex; align-items: center; gap: 0.3rem;
+        margin-bottom: 0.5rem; flex-wrap: wrap;
+    }
+    .trace-label {
+        font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em;
+        color: var(--text-faint); font-weight: 700; margin-right: 0.2rem;
+    }
+    .trace-pill {
+        display: inline-flex; align-items: center; gap: 0.25rem;
+        padding: 0.2rem 0.55rem; border-radius: var(--radius-pill);
+        font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    .trace-pill.tp-retriever { background: var(--teal-glow); color: var(--teal); border: 1px solid rgba(16,185,129,0.18); }
+    .trace-pill.tp-analyzer  { background: var(--amber-glow); color: var(--amber); border: 1px solid rgba(245,158,11,0.18); }
+    .trace-pill.tp-reporter  { background: var(--purple-glow); color: var(--purple); border: 1px solid rgba(167,139,250,0.18); }
+    .trace-arrow { color: var(--text-faint); font-size: 0.65rem; }
+
+    /* ── Source cards ──────────────────────────────────── */
+    .src-card {
+        background: var(--bg-elevated); border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md); padding: 0.6rem 0.8rem; margin-bottom: 0.35rem;
+        transition: all var(--transition);
+    }
+    .src-card:hover { border-color: var(--border-accent); }
+    .src-card .src-header {
+        font-size: 0.76rem; font-weight: 600; color: var(--text-primary);
+        margin-bottom: 0.2rem; display: flex; align-items: center; gap: 0.35rem;
+    }
+    .src-card .src-excerpt {
+        font-size: 0.72rem; color: var(--text-muted); line-height: 1.5;
+        font-style: italic; opacity: 0.85;
+    }
+
+    /* ═══════════════════ FOOTER ═══════════════════ */
+    .app-footer {
+        text-align: center; padding: 2rem 0 1rem;
+        margin-top: 3rem; border-top: 1px solid var(--border);
+    }
+    .footer-mission {
+        font-size: 0.82rem; color: var(--text-muted); max-width: 480px;
+        margin: 0 auto 1.25rem; line-height: 1.65;
+    }
+    .footer-credit {
+        font-size: 0.72rem; color: var(--text-faint); margin-bottom: 0.15rem;
+    }
+    .footer-name {
+        background: var(--gradient-brand); -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent; font-weight: 700;
+    }
+    .footer-legal {
+        font-size: 0.65rem; color: var(--text-faint);
+        letter-spacing: 0.02em;
+    }
+    .footer-links {
+        display: flex; justify-content: center; gap: 1rem;
+        margin-top: 0.85rem;
+    }
+    .footer-links a {
+        font-size: 0.7rem; color: var(--text-muted); text-decoration: none;
+        transition: color var(--transition); font-weight: 500;
+    }
+    .footer-links a:hover { color: var(--accent-light); }
     </style>
     """,
     unsafe_allow_html=True,
@@ -528,14 +585,13 @@ st.markdown(
 def _init_session():
     defaults = {
         "store_built": False,
-        "ingested_docs": [],
-        "report": None,
         "uploaded_names": [],
+        "chat_history": [],
+        "query_counter": 0,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
-
 
 _init_session()
 
@@ -547,23 +603,28 @@ with st.sidebar:
     st.markdown(
         """
         <div class="sidebar-brand">
-            <div><span class="brand-logo">✦</span></div>
+            <div class="brand-mark">◆</div>
             <div>
                 <div class="brand-text">FinRisk</div>
-                <div class="brand-sub">AI Risk Analysis</div>
+                <div class="brand-tagline">Instant answers from your financial documents</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    st.header("Documents")
+    st.markdown(
+        '<div class="sb-section-title">'
+        '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M3.5 3.75a.25.25 0 01.25-.25h8.5a.25.25 0 01.25.25v8.5a.25.25 0 01-.25.25h-8.5a.25.25 0 01-.25-.25v-8.5z"/></svg>'
+        'Documents</div>',
+        unsafe_allow_html=True,
+    )
 
     uploaded_files = st.file_uploader(
-        "Upload PDFs or CSVs",
+        "Upload financial documents",
         type=["pdf", "csv", "tsv", "xls", "xlsx"],
         accept_multiple_files=True,
-        help="Financial reports, balance sheets, income statements, etc.",
+        help="Annual reports, balance sheets, income statements, SEC filings",
     )
 
     # ── Ingest + embed on new uploads ───────────────────────────────
@@ -576,11 +637,9 @@ with st.sidebar:
 
             with st.spinner("Ingesting documents …"):
                 all_docs: list = []
-
                 for uf in uploaded_files:
                     dest = data_dir / uf.name
                     dest.write_bytes(uf.getvalue())
-
                     ext = Path(uf.name).suffix.lower()
                     try:
                         if ext == ".pdf":
@@ -588,19 +647,15 @@ with st.sidebar:
                             all_docs.extend(pages)
                         else:
                             result = load_csv(str(dest))
-                            all_docs.append(
-                                {
-                                    "text": result["summary"],
-                                    "source": result["source"],
-                                    "page": 0,
-                                    "tables": [],
-                                }
-                            )
+                            all_docs.append({
+                                "text": result["summary"],
+                                "source": result["source"],
+                                "page": 0,
+                                "tables": [],
+                            })
                     except Exception as exc:
                         st.error(f"Failed to load **{uf.name}**: {exc}")
                         logger.exception("Ingestion error for %s", uf.name)
-
-                st.session_state["ingested_docs"] = all_docs
 
             if all_docs:
                 with st.spinner("Chunking & embedding …"):
@@ -611,36 +666,23 @@ with st.sidebar:
                         if not chunks:
                             st.markdown(
                                 '<div class="upload-status warning">'
-                                "⚠ No extractable text found. This usually happens "
-                                "with scanned/image-based PDFs. Try a digitally-born "
-                                "PDF or CSV/Excel file."
+                                "⚠ No extractable text found."
                                 "</div>",
                                 unsafe_allow_html=True,
                             )
-                            logger.warning(
-                                "Chunker returned 0 chunks for %d doc(s)", len(all_docs)
-                            )
                         else:
                             embedder = DocumentEmbedder()
-                            store = embedder.embed_and_store(
-                                chunks, settings.VECTOR_DB_PATH
-                            )
+                            store = embedder.embed_and_store(chunks, settings.VECTOR_DB_PATH)
 
                             if store is not None:
                                 st.session_state["store_built"] = True
                                 st.session_state["uploaded_names"] = current_names
+                                st.session_state["chat_history"] = []
                                 st.markdown(
                                     f'<div class="upload-status success">'
                                     f"✓ Indexed {len(chunks)} chunks from "
                                     f"{len(uploaded_files)} file(s)"
                                     f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.markdown(
-                                    '<div class="upload-status warning">'
-                                    "⚠ Embedding returned no results."
-                                    "</div>",
                                     unsafe_allow_html=True,
                                 )
                     except Exception as exc:
@@ -651,343 +693,295 @@ with st.sidebar:
                             unsafe_allow_html=True,
                         )
                         logger.exception("Embedding error")
-            else:
-                st.markdown(
-                    '<div class="upload-status warning">'
-                    "⚠ No content extracted from the uploaded files."
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
 
-    st.divider()
-
-    st.header("Query")
-    query = st.text_area(
-        "Enter your financial risk question:",
-        height=100,
-        placeholder=(
-            "e.g., Assess the credit risk of ACME Corp based on their "
-            "2024 annual report."
-        ),
+    st.markdown(
+        '<div class="sb-section-title" style="margin-top: 1.25rem;">'
+        '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 12.5a4.5 4.5 0 100-9 4.5 4.5 0 000 9zM8 15A7 7 0 118 1a7 7 0 010 14z"/></svg>'
+        'System Configuration</div>',
+        unsafe_allow_html=True,
     )
-
-    run_btn = st.button(
-        "Run Analysis →",
-        type="primary",
-        use_container_width=True,
-        disabled=not st.session_state["store_built"],
-    )
-
-    if not st.session_state["store_built"]:
-        st.caption("Upload documents to enable analysis.")
-
-    st.divider()
 
     st.markdown(
         f"""
-        <div class="settings-card">
-            <div class="settings-label">Configuration</div>
-            Model <code>{settings.LLM_MODEL}</code><br>
-            Embeddings <code>{settings.EMBEDDING_MODEL}</code><br>
-            Chunk <code>{settings.CHUNK_SIZE}</code> · Overlap <code>{settings.CHUNK_OVERLAP}</code>
+        <div class="config-grid">
+            <div class="config-chip">
+                <div class="chip-label">Provider</div>
+                <div class="chip-value">{settings.LLM_PROVIDER}</div>
+            </div>
+            <div class="config-chip">
+                <div class="chip-label">Model</div>
+                <div class="chip-value">{settings.LLM_MODEL.split('/')[-1][:18]}</div>
+            </div>
+            <div class="config-chip">
+                <div class="chip-label">Embeddings</div>
+                <div class="chip-value">{settings.EMBEDDING_MODEL[:16]}</div>
+            </div>
+            <div class="config-chip">
+                <div class="chip-label">Chunk / Overlap</div>
+                <div class="chip-value">{settings.CHUNK_SIZE} / {settings.CHUNK_OVERLAP}</div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if st.session_state["report"]:
-        st.markdown("<br>", unsafe_allow_html=True)
-        report_json = json.dumps(st.session_state["report"], indent=2, default=str)
-        st.download_button(
-            label="↓ Export Report JSON",
-            data=report_json,
-            file_name="risk_report.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
 
 # ═════════════════════════════════════════════════════════════════════
-# MAIN: RUN ANALYSIS
+# FOOTER HELPER
 # ═════════════════════════════════════════════════════════════════════
-if run_btn:
-    if not query.strip():
-        st.warning("Please enter a question before running the analysis.")
-        st.stop()
 
-    with st.spinner("Analyzing …"):
-        try:
-            report = run_analysis(query=query.strip())
-            st.session_state["report"] = report
-        except Exception as exc:
-            st.error(f"Analysis failed: {exc}")
-            logger.exception("run_analysis error")
-            st.stop()
-
-
-# ═════════════════════════════════════════════════════════════════════
-# MAIN: DISPLAY
-# ═════════════════════════════════════════════════════════════════════
-report = st.session_state.get("report")
-
-if report:
-    st.title("Financial Risk Report")
-
-    tab_report, tab_metrics, tab_sources, tab_trace = st.tabs(
-        ["Risk Report", "Financial Metrics", "Sources", "Agent Trace"]
+def _render_footer():
+    st.markdown(
+        """
+        <div class="app-footer">
+            <div class="footer-mission">
+                FinRisk makes financial document analysis instant, accurate,
+                and explainable — powered by multi-agent AI and RAG.
+            </div>
+            <div class="footer-credit">
+                Developed by <span class="footer-name">Aryan Bhardwaj</span>
+            </div>
+            <div class="footer-legal">© 2026. All rights reserved.</div>
+            <div class="footer-links">
+                <a href="#">GitHub</a>
+                <a href="#">Documentation</a>
+                <a href="#">Contact</a>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    # ── TAB 1: Risk Report ──────────────────────────────────────────
-    with tab_report:
-        risk_level = report.get("risk_level", "UNKNOWN")
-        badge = report.get("risk_badge", risk_level)
-        st.markdown(
-            f'<div class="risk-badge risk-{risk_level}">{badge}</div>',
-            unsafe_allow_html=True,
-        )
 
-        st.markdown('<div class="sh"><span class="sh-icon">◈</span><span class="sh-title">Executive Summary</span></div>', unsafe_allow_html=True)
-        st.markdown(report.get("summary", "*No summary available.*"))
-        st.divider()
+# ═════════════════════════════════════════════════════════════════════
+# MAIN AREA
+# ═════════════════════════════════════════════════════════════════════
 
-        anomalies = report.get("anomalies", [])
-        if anomalies:
-            st.markdown('<div class="sh"><span class="sh-icon">△</span><span class="sh-title">Detected Anomalies</span></div>', unsafe_allow_html=True)
-            rows = [{"Metric": a.get("metric",""), "Description": a.get("description",""), "Severity": a.get("severity","info").upper()} for a in anomalies]
-            df_a = pd.DataFrame(rows)
-            def _cs(v):
-                return {"CRITICAL":"color:#f87171;font-weight:700","WARNING":"color:#fbbf24;font-weight:600","INFO":"color:#60a5fa"}.get(v,"")
-            st.dataframe(df_a.style.applymap(_cs, subset=["Severity"]), use_container_width=True, hide_index=True)
+if st.session_state["store_built"]:
+    # ── Q&A Top bar ─────────────────────────────────────────────────
+    st.markdown(
+        """
+        <div class="qa-topbar">
+            <div class="qa-logo">
+                <div class="qa-logo-mark">◆</div>
+                <div class="qa-logo-text">FinRisk</div>
+            </div>
+            <div class="qa-badge">● Connected · Ready</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.title("Ask About Your Documents")
+
+    # ── Display chat history ────────────────────────────────────────
+    for entry in st.session_state["chat_history"]:
+        if entry["role"] == "user":
+            st.markdown(
+                f'<div class="q-bubble">'
+                f'<div class="q-icon">?</div>'
+                f'<span class="q-text">{entry["content"]}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
         else:
-            st.info("No anomalies detected.")
-        st.divider()
+            # Agent trace
+            trace = entry.get("agent_trace", [])
+            if trace:
+                trace_html = ""
+                for i, step in enumerate(trace):
+                    cls = step if step in ("retriever", "analyzer", "reporter") else "analyzer"
+                    icons = {"retriever": "⊕", "analyzer": "◈", "reporter": "▣"}
+                    icon = icons.get(step, "⚙")
+                    trace_html += f'<span class="trace-pill tp-{cls}">{icon} {step}</span>'
+                    if i < len(trace) - 1:
+                        trace_html += '<span class="trace-arrow">→</span>'
+                st.markdown(
+                    f'<div class="trace-bar">'
+                    f'<span class="trace-label">Agents:</span>'
+                    f'{trace_html}</div>',
+                    unsafe_allow_html=True,
+                )
 
-        recs = report.get("recommendations", [])
-        if recs:
-            st.markdown('<div class="sh"><span class="sh-icon">◇</span><span class="sh-title">Recommendations</span></div>', unsafe_allow_html=True)
-            for i, rec in enumerate(recs, 1):
-                st.markdown(f"**{i}.** {rec}")
-        st.divider()
+            # Answer
+            st.markdown(
+                f'<div class="a-card">{entry["content"]}</div>',
+                unsafe_allow_html=True,
+            )
 
-        st.markdown('<div class="sh"><span class="sh-icon">◎</span><span class="sh-title">Risk Justification</span></div>', unsafe_allow_html=True)
-        st.markdown(report.get("justification", "*No justification.*"))
-        st.divider()
+            # Sources
+            sources = entry.get("sources", [])
+            if sources:
+                with st.expander(f"📑 Sources — {len(sources)} document section(s)"):
+                    for i, src in enumerate(sources, 1):
+                        st.markdown(
+                            f"""
+                            <div class="src-card">
+                                <div class="src-header">▸ {src['source']} · Page {src['page']}</div>
+                                <div class="src-excerpt">"{src['excerpt']}"</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
 
-        verified = report.get("verification_status", False)
-        v_notes = report.get("verification_notes", [])
-        if verified:
-            st.success("✓ **Verified** — All key metrics traced to source documents.")
-        else:
-            st.warning("△ **Partially Verified** — Some metrics could not be confirmed.")
-        if v_notes:
-            with st.expander("Verification details"):
-                for note in v_notes:
-                    st.markdown(f"- {note}")
+    # ── Question input ──────────────────────────────────────────────
+    st.markdown("---")
+    query = st.text_area(
+        "Ask a question about your financial documents:",
+        height=80,
+        placeholder=(
+            "e.g., What is the company's total revenue? "
+            "Is the debt ratio concerning? "
+            "Summarize the key financial highlights."
+        ),
+        key=f"query_input_{st.session_state['query_counter']}",
+    )
 
-    # ── TAB 2: Financial Metrics ────────────────────────────────────
-    with tab_metrics:
-        key_metrics = report.get("key_metrics", [])
-        if key_metrics:
-            st.markdown('<div class="sh"><span class="sh-icon">◈</span><span class="sh-title">Key Financial Ratios</span></div>', unsafe_allow_html=True)
-            cols = st.columns(min(len(key_metrics), 4))
-            for idx, m in enumerate(key_metrics[:4]):
-                with cols[idx]:
-                    s = m.get("status","").upper()
-                    dc = "inverse" if s == "CRITICAL" else ("off" if s == "WARNING" else "normal")
-                    st.metric(label=m.get("name",""), value=m.get("value","N/A"), delta=s or None, delta_color=dc)
-            st.divider()
+    col1, col2, _ = st.columns([1, 1, 3])
+    with col1:
+        ask_btn = st.button("Ask →", type="primary", use_container_width=True)
+    with col2:
+        if st.button("Clear Chat", use_container_width=True):
+            st.session_state["chat_history"] = []
+            st.rerun()
 
-            rows = [{"Ratio":m.get("name",""),"Value":m.get("value"),"Status":m.get("status","").upper(),"Threshold":m.get("threshold","")} for m in key_metrics]
-            df_m = pd.DataFrame(rows)
-            def _cst(v):
-                return {"SAFE":"background-color:rgba(52,211,153,0.1);color:#34d399;font-weight:600","WARNING":"background-color:rgba(251,191,36,0.1);color:#fbbf24;font-weight:600","CRITICAL":"background-color:rgba(248,113,113,0.1);color:#f87171;font-weight:700"}.get(v,"")
-            st.dataframe(df_m.style.applymap(_cst, subset=["Status"]), use_container_width=True, hide_index=True)
-            st.divider()
+    # ── Process question ────────────────────────────────────────────
+    if ask_btn and query.strip():
+        st.session_state["chat_history"].append({
+            "role": "user",
+            "content": query.strip(),
+            "sources": [],
+            "agent_trace": [],
+        })
 
-            st.markdown('<div class="sh"><span class="sh-icon">▊</span><span class="sh-title">Ratio Values</span></div>', unsafe_allow_html=True)
-            cd = pd.DataFrame({"Ratio":[m.get("name","") for m in key_metrics],"Value":[m.get("value",0) or 0 for m in key_metrics]}).set_index("Ratio")
-            st.bar_chart(cd)
-        else:
-            st.info("No financial metrics computed.")
+        with st.spinner("⊕ Retrieving → ◈ Analyzing → ▣ Reporting …"):
+            try:
+                result = ask_question(query.strip())
+                st.session_state["chat_history"].append({
+                    "role": "assistant",
+                    "content": result["answer"],
+                    "sources": result["sources"],
+                    "agent_trace": result.get("agent_trace", []),
+                })
+            except Exception as exc:
+                st.session_state["chat_history"].append({
+                    "role": "assistant",
+                    "content": f"⚠ Error generating answer: {exc}",
+                    "sources": [],
+                    "agent_trace": [],
+                })
+                logger.exception("Q&A error")
 
-    # ── TAB 3: Sources ──────────────────────────────────────────────
-    with tab_sources:
-        sources = report.get("sources", [])
-        if sources:
-            st.markdown(f'<div class="sh"><span class="sh-icon">◉</span><span class="sh-title">Retrieved Sources ({len(sources)})</span></div>', unsafe_allow_html=True)
-            for i, src in enumerate(sources, 1):
-                pg = src.get("page","?")
-                sf = Path(src.get("source","unknown")).name
-                with st.expander(f"Source {i} — {sf} · p.{pg}"):
-                    st.markdown(f"**File:** `{sf}` · **Page:** {pg}")
-                    st.divider()
-                    st.markdown(src.get("excerpt",""))
-        else:
-            st.info("No source chunks retrieved.")
+        st.session_state["query_counter"] += 1
+        st.rerun()
 
-    # ── TAB 4: Agent Trace ──────────────────────────────────────────
-    with tab_trace:
-        trace = report.get("agent_trace", [])
-        if trace:
-            st.markdown('<div class="sh"><span class="sh-icon">◈</span><span class="sh-title">Execution Timeline</span></div>', unsafe_allow_html=True)
-            rc = trace.count("retriever")
-            if rc > 1:
-                st.info(f"↻ **{rc-1} re-retrieval(s)** during analysis (total: {rc}).")
-            icons = {"planner":"◇","retriever":"◎","analyst":"▊","evaluator":"△","verifier":"◈","reporter":"◉"}
-            for idx, a in enumerate(trace, 1):
-                st.markdown(f'<div class="trace-step"><span class="trace-dot"></span><strong>Step {idx}</strong>&nbsp;&nbsp;{icons.get(a,"·")} {a}</div>', unsafe_allow_html=True)
-            st.divider()
-            st.caption(" → ".join(trace))
-        else:
-            st.info("No agent trace available.")
+    elif ask_btn:
+        st.warning("Please enter a question.")
+
+    _render_footer()
 
 else:
     # ═════════════════════════════════════════════════════════════════
-    # LANDING PAGE — FULL SCREEN
+    # LANDING PAGE
     # ═════════════════════════════════════════════════════════════════
-
-    # Background orbs
     st.markdown(
-        """
-        <div class="bg-glow">
-            <div class="orb orb-1"></div>
-            <div class="orb orb-2"></div>
-            <div class="orb orb-3"></div>
-        </div>
-        """,
+        '<div class="hero-bg"></div>',
         unsafe_allow_html=True,
     )
 
-    # Hero wrapper
     st.markdown('<div class="hero-wrapper">', unsafe_allow_html=True)
 
-    # Top bar
+    # ── Top bar ─────────────────────────────────────────────────────
     st.markdown(
         """
-        <div class="top-bar">
-            <div class="top-logo"><span>✦</span> FinRisk</div>
-            <div class="top-badge">Multi-Agent AI</div>
+        <div class="hero-topbar">
+            <div class="hero-logo">
+                <div class="hero-logo-mark">◆</div>
+                <span class="hero-logo-text">FinRisk</span>
+            </div>
+            <div class="hero-tag">LangGraph · LangChain · RAG</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Hero center
+    # ── Hero center ─────────────────────────────────────────────────
     st.markdown(
         """
         <div class="hero-center">
-            <div class="hero-title">Intelligent Financial<br>Risk Analysis</div>
+            <div class="hero-eyebrow">Multi-Agent Financial Intelligence</div>
+            <div class="hero-title">Turn dense financial reports<br>into instant insight.</div>
             <div class="hero-sub">
-                Upload your financial documents and let our AI agent pipeline
-                analyze risks, detect anomalies, and deliver verified assessments
-                with actionable recommendations.
+                Upload annual reports, balance sheets, or SEC filings.
+                Our LangGraph agent pipeline retrieves, analyzes, and formats
+                accurate answers with source citations.
+            </div>
+            <div class="hero-trust">
+                <span><span class="dot"></span> Annual Reports</span>
+                <span><span class="dot"></span> Balance Sheets</span>
+                <span><span class="dot"></span> Income Statements</span>
+                <span><span class="dot"></span> SEC Filings</span>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # Stats
+    # ── Stat cards ──────────────────────────────────────────────────
     st.markdown(
         """
-        <div class="stats-row">
-            <div class="stat-item">
-                <div class="stat-value">6</div>
-                <div class="stat-label">AI Agents</div>
+        <div class="stat-grid">
+            <div class="stat-card">
+                <div class="stat-icon">⊕</div>
+                <div class="stat-val">3</div>
+                <div class="stat-desc">AI Agents</div>
             </div>
-            <div class="stat-item">
-                <div class="stat-value">5+</div>
-                <div class="stat-label">File Formats</div>
+            <div class="stat-card">
+                <div class="stat-icon">◈</div>
+                <div class="stat-val">5+</div>
+                <div class="stat-desc">File Formats</div>
             </div>
-            <div class="stat-item">
-                <div class="stat-value">RAG</div>
-                <div class="stat-label">Powered</div>
+            <div class="stat-card">
+                <div class="stat-icon">⬡</div>
+                <div class="stat-val">RAG</div>
+                <div class="stat-desc">Retrieval</div>
             </div>
-            <div class="stat-item">
-                <div class="stat-value">✓</div>
-                <div class="stat-label">Source Verified</div>
+            <div class="stat-card">
+                <div class="stat-icon">▣</div>
+                <div class="stat-val">✓</div>
+                <div class="stat-desc">Source Cited</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # 3-step cards
+    # ── How it works ────────────────────────────────────────────────
     st.markdown(
         """
-        <div class="steps-row">
+        <div class="steps-grid">
             <div class="step-card">
-                <div class="step-num">1</div>
+                <div class="step-icon si-1">↑</div>
                 <div class="step-title">Upload Documents</div>
-                <div class="step-desc">Drag & drop PDFs, CSVs, or Excel files containing financial reports, balance sheets, or income statements.</div>
-            </div>
-            <div class="step-card">
-                <div class="step-num">2</div>
-                <div class="step-title">Ask a Question</div>
-                <div class="step-desc">Enter a specific risk analysis question — credit risk, liquidity concerns, solvency ratios, trend analysis.</div>
-            </div>
-            <div class="step-card">
-                <div class="step-num">3</div>
-                <div class="step-title">Get AI Report</div>
-                <div class="step-desc">Receive a comprehensive risk report with anomaly detection, financial ratios, and source-verified recommendations.</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Bottom grid: Pipeline + Features
-    st.markdown(
-        """
-        <div class="bottom-grid">
-            <div class="card-block">
-                <div class="card-header">Agent Pipeline</div>
-                <div class="pipe-list">
-                    <div class="pipe-item">
-                        <div class="pipe-icon p1">◇</div>
-                        <div><div class="pipe-name">Planner</div><div class="pipe-desc">Designs analysis strategy</div></div>
-                    </div>
-                    <div class="pipe-item">
-                        <div class="pipe-icon p2">◎</div>
-                        <div><div class="pipe-name">Retriever</div><div class="pipe-desc">Fetches relevant sections</div></div>
-                    </div>
-                    <div class="pipe-item">
-                        <div class="pipe-icon p3">▊</div>
-                        <div><div class="pipe-name">Analyst</div><div class="pipe-desc">Computes financial metrics</div></div>
-                    </div>
-                    <div class="pipe-item">
-                        <div class="pipe-icon p4">△</div>
-                        <div><div class="pipe-name">Evaluator</div><div class="pipe-desc">Assesses risk levels</div></div>
-                    </div>
-                    <div class="pipe-item">
-                        <div class="pipe-icon p5">◈</div>
-                        <div><div class="pipe-name">Verifier</div><div class="pipe-desc">Cross-checks sources</div></div>
-                    </div>
-                    <div class="pipe-item">
-                        <div class="pipe-icon p6">◉</div>
-                        <div><div class="pipe-name">Reporter</div><div class="pipe-desc">Generates final report</div></div>
-                    </div>
+                <div class="step-desc">
+                    Drag & drop PDFs, CSVs, or Excel files. Financial reports are
+                    chunked, embedded, and indexed locally.
                 </div>
             </div>
-            <div class="card-block">
-                <div class="card-header">Features</div>
-                <div class="feat-list">
-                    <div class="feat-item">
-                        <div class="feat-dot d1"></div>
-                        <div><div class="feat-name">Smart Document Parsing</div><div class="feat-desc">Extracts text and tables from PDFs with automatic fallback to PyMuPDF for complex layouts.</div></div>
-                    </div>
-                    <div class="feat-item">
-                        <div class="feat-dot d2"></div>
-                        <div><div class="feat-name">RAG-Powered Analysis</div><div class="feat-desc">Retrieval-augmented generation ensures answers are grounded in your actual documents.</div></div>
-                    </div>
-                    <div class="feat-item">
-                        <div class="feat-dot d3"></div>
-                        <div><div class="feat-name">Anomaly Detection</div><div class="feat-desc">Automatically identifies unusual patterns, outliers, and red flags in financial data.</div></div>
-                    </div>
-                    <div class="feat-item">
-                        <div class="feat-dot d4"></div>
-                        <div><div class="feat-name">Source Verification</div><div class="feat-desc">Every finding is traced back to the original document with page-level citations.</div></div>
-                    </div>
+            <div class="step-card">
+                <div class="step-icon si-2">◎</div>
+                <div class="step-title">Ask Any Question</div>
+                <div class="step-desc">
+                    Revenue trends, debt ratios, risk factors — ask in natural
+                    language and let the agents find answers.
+                </div>
+            </div>
+            <div class="step-card">
+                <div class="step-icon si-3">✦</div>
+                <div class="step-title">Get Cited Answers</div>
+                <div class="step-desc">
+                    Receive structured, professional answers grounded in your
+                    documents with exact source citations.
                 </div>
             </div>
         </div>
@@ -995,18 +989,49 @@ else:
         unsafe_allow_html=True,
     )
 
-    # Supported formats
+    # ── Agent pipeline ──────────────────────────────────────────────
     st.markdown(
         """
-        <div class="formats-bar">
-            <div class="format-tag">PDF</div>
-            <div class="format-tag">CSV</div>
-            <div class="format-tag">TSV</div>
-            <div class="format-tag">XLS</div>
-            <div class="format-tag">XLSX</div>
+        <div class="pipeline-section">
+            <div class="pipeline-header">LangGraph Agent Pipeline</div>
+            <div class="pipeline-row">
+                <div class="agent-card ag-retriever">
+                    <div class="agent-icon">⊕</div>
+                    <div class="agent-name an-retriever">Retriever</div>
+                    <div class="agent-role">Scans and retrieves relevant document sections using FAISS vector search</div>
+                </div>
+                <div class="pipeline-arrow">→</div>
+                <div class="agent-card ag-analyzer">
+                    <div class="agent-icon">◈</div>
+                    <div class="agent-name an-analyzer">Analyzer</div>
+                    <div class="agent-role">Identifies key metrics, patterns, and answers using LLM reasoning</div>
+                </div>
+                <div class="pipeline-arrow">→</div>
+                <div class="agent-card ag-reporter">
+                    <div class="agent-icon">▣</div>
+                    <div class="agent-name an-reporter">Reporter</div>
+                    <div class="agent-role">Formats a professional, cited answer with clear structure</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── File formats ────────────────────────────────────────────────
+    st.markdown(
+        """
+        <div class="format-bar">
+            <div class="fmt-chip fc-pdf"><span class="fmt-icon">▤</span> PDF</div>
+            <div class="fmt-chip fc-csv"><span class="fmt-icon">▦</span> CSV</div>
+            <div class="fmt-chip fc-csv"><span class="fmt-icon">▦</span> TSV</div>
+            <div class="fmt-chip fc-xls"><span class="fmt-icon">▧</span> XLS</div>
+            <div class="fmt-chip fc-xls"><span class="fmt-icon">▧</span> XLSX</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.markdown('</div>', unsafe_allow_html=True)
+
+    _render_footer()

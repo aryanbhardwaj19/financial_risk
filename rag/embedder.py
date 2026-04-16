@@ -1,10 +1,13 @@
 """
 Document embedder — builds and manages a FAISS vector store backed by
-HuggingFace ``sentence-transformers`` embeddings.
+local HuggingFace sentence-transformer embeddings.
 
-The embedding model is configured via ``settings.EMBEDDING_MODEL``
-(default: ``all-MiniLM-L6-v2``).  The FAISS index is persisted to disk
-so it survives process restarts.
+Uses ``all-MiniLM-L6-v2`` by default (~80 MB, runs on CPU).  No API
+keys or network access required for embedding — fully offline after
+the model is downloaded once.
+
+The embedding model is configured via ``settings.EMBEDDING_MODEL``.
+The FAISS index is persisted to disk so it survives process restarts.
 
 Usage
 -----
@@ -32,38 +35,32 @@ logger = get_logger(__name__)
 
 
 class DocumentEmbedder:
-    """Wraps HuggingFace embeddings + FAISS for persist-and-reload
-    workflows.
+    """Wraps HuggingFace sentence-transformer embeddings + FAISS for
+    persist-and-reload workflows.
 
     Parameters
     ----------
     model_name : str, optional
         HuggingFace model identifier.  Defaults to
-        ``settings.EMBEDDING_MODEL``.
-    device : str, optional
-        PyTorch device string (``"cpu"``, ``"cuda"``, …).  Defaults to
-        ``"cpu"``.
+        ``settings.EMBEDDING_MODEL`` (``all-MiniLM-L6-v2``).
     """
 
     def __init__(
         self,
         model_name: Optional[str] = None,
-        device: str = "cpu",
+        **kwargs,
     ) -> None:
         self.model_name = model_name or settings.EMBEDDING_MODEL
 
         logger.info(
-            "Initialising HuggingFace embeddings: model=%s, device=%s",
+            "Initialising HuggingFace embeddings: model=%s",
             self.model_name,
-            device,
         )
 
         self._embeddings = HuggingFaceEmbeddings(
             model_name=self.model_name,
-            model_kwargs={"device": device},
-            encode_kwargs={
-                "normalize_embeddings": True,
-            },
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
         )
 
     # ── Public API ──────────────────────────────────────────────────

@@ -19,9 +19,9 @@ import json
 from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from config import settings
+from utils.llm_factory import get_llm
 from graph.state import AgentState
 from utils.logger import get_logger
 
@@ -100,11 +100,7 @@ def evaluator_agent(state: AgentState) -> Dict[str, Any]:
     }
     payload_str = json.dumps(payload, indent=2, default=str)
 
-    llm = ChatOpenAI(
-        model=settings.LLM_MODEL,
-        api_key=settings.OPENAI_API_KEY,
-        temperature=0.0,
-    )
+    llm = get_llm(temperature=0.0)
 
     messages = [
         SystemMessage(content=_SYSTEM_PROMPT),

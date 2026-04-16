@@ -17,9 +17,9 @@ from typing import Any, Dict, List
 
 from langchain.schema import Document
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from config import settings
+from utils.llm_factory import get_llm
 from graph.state import AgentState
 from utils.logger import get_logger
 
@@ -125,11 +125,7 @@ def reporter_agent(state: AgentState) -> Dict[str, Any]:
     agent_trace: List[str] = state.get("agent_trace", [])
 
     # ── LLM-generated summary + recommendations ────────────────────
-    llm = ChatOpenAI(
-        model=settings.LLM_MODEL,
-        api_key=settings.OPENAI_API_KEY,
-        temperature=0.3,
-    )
+    llm = get_llm(temperature=0.3)
 
     context = (
         f"Risk level: {risk_level}\n"

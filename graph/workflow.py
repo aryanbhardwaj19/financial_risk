@@ -1,318 +1,243 @@
 """
-LangGraph workflow — wires the six agents into a stateful, checkpointed
-graph with conditional re-retrieval and verification loops.
+Simple LangGraph workflow for financial document Q&A.
 
-Graph topology
---------------
-::
+Demonstrates LangChain + LangGraph agent orchestration with a
+3-node pipeline:
 
-    START → planner → retriever ──┐
-                         ▲        │
-                         │   (missing_data && iter < 3?)
-                         │        │
-                         └── yes ─┘
-                              no ──→ analyst → evaluator → verifier ──┐
-                                                             ▲        │
-                                                             │  (¬verified && iter < 2?)
-                                                             │        │
-                                                             └── yes ─┘
-                                                                  no ──→ reporter → END
+    ┌──────────┐     ┌──────────┐     ┌──────────┐
+    │ Retriever│ ──▶ │ Analyzer │ ──▶ │ Reporter │
+    └──────────┘     └──────────┘     └──────────┘
 
-Checkpointing
--------------
-Uses ``MemorySaver`` so conversation state persists across turns within
-the same process.
+- **Retriever**: Fetches relevant chunks from the FAISS vector store.
+- **Analyzer**: Uses the LLM to analyze the retrieved context.
+- **Reporter**: Formats the final answer with structured output.
 
-Public API
-----------
-    from graph.workflow import run_analysis
-
-    report = run_analysis(
-        query="Assess ACME Corp credit risk",
-        documents=loaded_docs,
-    )
+Usage
+-----
+    from graph.workflow import run_qa_pipeline
+    result = run_qa_pipeline(query, store)
 """
 
 from __future__ import annotations
 
-import uuid
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, TypedDict
 
 from langchain.schema import Document
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph, END
 
-from graph.state import AgentState, initial_state
-from agents.planner import planner_agent
-from agents.retriever_agent import retriever_agent
-from agents.analyst import analyst_agent
-from agents.evaluator import evaluator_agent
-from agents.verifier import verifier_agent
-from agents.reporter import reporter_agent
+from rag.retriever import FinancialRetriever
+from utils.llm_factory import get_llm
 from utils.logger import get_logger
-from utils.mlflow_tracker import RiskAnalysisTracker
 
 logger = get_logger(__name__)
 
-# ── Query broadening suffix (used on re-entry) ─────────────────────
-_BROADENED_SUFFIX = (
-    " financial statements overview balance sheet cash flow"
-)
+
+# ── Graph State ─────────────────────────────────────────────────────
+
+class QAState(TypedDict, total=False):
+    """State object passed between nodes in the LangGraph."""
+    query: str
+    context: str
+    chunk_count: int
+    analysis: str
+    sources: List[dict]
+    final_answer: str
+    agent_trace: List[str]
 
 
-# ── Wrapper nodes ───────────────────────────────────────────────────
-# The retriever node needs special pre-processing logic on re-entry,
-# so we wrap it rather than registering the raw agent function.
+# ── Node definitions ───────────────────────────────────────────────
+
+_ANALYZER_SYSTEM = """\
+You are a senior financial analyst. Analyze the provided document
+excerpts and answer the user's question.
+
+Rules:
+- Base your answer strictly on the context provided.
+- If the context does not contain enough information, say so clearly.
+- Use specific numbers, ratios, and data from the context.
+- Be concise but thorough.
+- Structure your answer with bullet points or sections when helpful.
+"""
+
+_REPORTER_SYSTEM = """\
+You are a report formatter. Take the analysis provided and produce
+a clean, well-structured final answer. Keep the same content but
+ensure it reads professionally. Use markdown formatting (bold,
+bullet points, headers) for clarity.
+
+Output ONLY the formatted answer — no preamble.
+"""
 
 
-def _retriever_node(state: AgentState) -> Dict[str, Any]:
-    """Retriever wrapper that widens the query on re-entry and bumps
-    the iteration counter.
+def _make_retriever_agent(store):
+    """Create a retriever agent node with the FAISS store bound via closure."""
+    _RETRIEVER_K = 8
 
-    On the **first** call (``iteration_count == 0``) the original query
-    is used as-is.  On subsequent calls the query is broadened by
-    appending domain keywords so the vector search casts a wider net.
-    """
-    iteration: int = state.get("iteration_count", 0)
-    original_query: str = state["query"]
+    def retriever_agent(state: QAState) -> Dict[str, Any]:
+        """Retrieve relevant chunks from the vector store."""
+        query = state["query"]
+        logger.info("▶ retriever_agent | query='%.80s…'", query)
 
-    if iteration > 0:
-        widened = original_query + _BROADENED_SUFFIX
-        logger.info(
-            "Retriever re-entry (iter=%d) — broadened query: '%.120s…'",
-            iteration,
-            widened,
+        retriever = FinancialRetriever(store)
+        chunks = retriever.retrieve(query, k=_RETRIEVER_K)
+
+        # Build context string from chunks
+        context = "\n\n".join(
+            f"[Section {i}]\n{doc.page_content}"
+            for i, doc in enumerate(chunks, 1)
         )
-        # Temporarily override query for this retrieval pass.
-        state_copy = dict(state)
-        state_copy["query"] = widened
-        result = retriever_agent(state_copy)
-    else:
-        result = retriever_agent(state)
 
-    # Always increment iteration_count on every retriever pass.
-    result["iteration_count"] = iteration + 1
-    return result
+        # Build source citations
+        sources = []
+        seen = set()
+        for doc in chunks:
+            meta = doc.metadata
+            source_key = (meta.get("source", ""), meta.get("page", ""))
+            if source_key not in seen:
+                seen.add(source_key)
+                excerpt = doc.page_content[:200].replace("\n", " ").strip()
+                if len(doc.page_content) > 200:
+                    excerpt += " …"
+                sources.append({
+                    "source": Path(meta.get("source", "unknown")).name,
+                    "page": str(meta.get("page", "?")),
+                    "excerpt": excerpt,
+                })
 
+        logger.info("◀ retriever_agent | chunks=%d, sources=%d", len(chunks), len(sources))
 
-# ── Conditional edge functions ──────────────────────────────────────
+        return {
+            "context": context,
+            "chunk_count": len(chunks),
+            "sources": sources,
+            "agent_trace": ["retriever"],
+        }
 
-
-def _after_retriever(state: AgentState) -> str:
-    """Decide whether to re-retrieve or proceed to the analyst.
-
-    Re-retrieves if:
-    - ``missing_data`` is ``True``  **and**
-    - ``iteration_count < 3``
-    """
-    missing: bool = state.get("missing_data", False)
-    iteration: int = state.get("iteration_count", 0)
-
-    if missing and iteration < 3:
-        logger.info(
-            "Conditional: missing_data=True, iter=%d < 3 → re-retrieve",
-            iteration,
-        )
-        return "retriever"
-
-    logger.info(
-        "Conditional: missing_data=%s, iter=%d → analyst",
-        missing,
-        iteration,
-    )
-    return "analyst"
+    return retriever_agent
 
 
-def _after_verifier(state: AgentState) -> str:
-    """Decide whether to loop back for more evidence or proceed to the
-    reporter.
+def analyzer_agent(state: QAState) -> Dict[str, Any]:
+    """Analyze retrieved context using the LLM."""
+    query = state["query"]
+    context = state.get("context", "")
+    chunk_count = state.get("chunk_count", 0)
 
-    Loops back if:
-    - ``verified`` is ``False``  **and**
-    - ``iteration_count < 2``
-    """
-    verified: bool = state.get("verified", False)
-    iteration: int = state.get("iteration_count", 0)
+    logger.info("▶ analyzer_agent | context_length=%d", len(context))
 
-    if not verified and iteration < 2:
-        logger.info(
-            "Conditional: verified=False, iter=%d < 2 → retriever (re-evidence)",
-            iteration,
-        )
-        return "retriever"
+    if not context:
+        return {
+            "analysis": "No relevant information was found in the uploaded documents for this question.",
+            "agent_trace": state.get("agent_trace", []) + ["analyzer"],
+        }
 
-    logger.info(
-        "Conditional: verified=%s, iter=%d → reporter",
-        verified,
-        iteration,
-    )
-    return "reporter"
+    llm = get_llm(temperature=0.2)
+    messages = [
+        SystemMessage(content=_ANALYZER_SYSTEM),
+        HumanMessage(content=(
+            f"Document context:\n\n{context}\n\n---\n\n"
+            f"Question: {query}"
+        )),
+    ]
 
+    response = llm.invoke(messages)
+    analysis = response.content.strip()
 
-# ── Graph assembly ──────────────────────────────────────────────────
+    logger.info("◀ analyzer_agent | answer_length=%d", len(analysis))
 
-
-def build_graph() -> StateGraph:
-    """Construct the full LangGraph workflow.
-
-    Returns
-    -------
-    CompiledGraph
-        A compiled, checkpointed graph ready for ``.invoke()``.
-    """
-    workflow = StateGraph(AgentState)
-
-    # ── Register nodes ──────────────────────────────────────────────
-    workflow.add_node("planner", planner_agent)
-    workflow.add_node("retriever", _retriever_node)
-    workflow.add_node("analyst", analyst_agent)
-    workflow.add_node("evaluator", evaluator_agent)
-    workflow.add_node("verifier", verifier_agent)
-    workflow.add_node("reporter", reporter_agent)
-
-    # ── Edges ───────────────────────────────────────────────────────
-    # START → planner → retriever
-    workflow.add_edge(START, "planner")
-    workflow.add_edge("planner", "retriever")
-
-    # retriever → conditional: re-retrieve or analyst
-    workflow.add_conditional_edges(
-        "retriever",
-        _after_retriever,
-        {
-            "retriever": "retriever",
-            "analyst": "analyst",
-        },
-    )
-
-    # analyst → evaluator → verifier
-    workflow.add_edge("analyst", "evaluator")
-    workflow.add_edge("evaluator", "verifier")
-
-    # verifier → conditional: loop back to retriever or reporter
-    workflow.add_conditional_edges(
-        "verifier",
-        _after_verifier,
-        {
-            "retriever": "retriever",
-            "reporter": "reporter",
-        },
-    )
-
-    # reporter → END
-    workflow.add_edge("reporter", END)
-
-    # ── Compile with checkpointing ──────────────────────────────────
-    memory = MemorySaver()
-    compiled = workflow.compile(checkpointer=memory)
-
-    logger.info("LangGraph workflow compiled with MemorySaver checkpointing")
-    return compiled
+    return {
+        "analysis": analysis,
+        "agent_trace": state.get("agent_trace", []) + ["analyzer"],
+    }
 
 
-# Module-level singleton so the graph is compiled once per process.
-_graph = None
+def reporter_agent(state: QAState) -> Dict[str, Any]:
+    """Format the analysis into a polished final answer."""
+    analysis = state.get("analysis", "")
+    chunk_count = state.get("chunk_count", 0)
+
+    logger.info("▶ reporter_agent | analysis_length=%d", len(analysis))
+
+    if not analysis or "no relevant information" in analysis.lower():
+        return {
+            "final_answer": analysis or "Unable to generate a response.",
+            "agent_trace": state.get("agent_trace", []) + ["reporter"],
+        }
+
+    llm = get_llm(temperature=0.1)
+    messages = [
+        SystemMessage(content=_REPORTER_SYSTEM),
+        HumanMessage(content=(
+            f"Analysis to format (based on {chunk_count} document sections):\n\n{analysis}"
+        )),
+    ]
+
+    response = llm.invoke(messages)
+    final_answer = response.content.strip()
+
+    logger.info("◀ reporter_agent | final_length=%d", len(final_answer))
+
+    return {
+        "final_answer": final_answer,
+        "agent_trace": state.get("agent_trace", []) + ["reporter"],
+    }
 
 
-def _get_graph():
-    """Lazily build and cache the compiled graph."""
-    global _graph  # noqa: PLW0603
-    if _graph is None:
-        _graph = build_graph()
-    return _graph
+# ── Build & Run ─────────────────────────────────────────────────────
 
-
-# ── Public API ──────────────────────────────────────────────────────
-
-
-def run_analysis(
+def run_qa_pipeline(
     query: str,
-    documents: Optional[List[Document]] = None,
-    thread_id: Optional[str] = None,
+    store,
 ) -> Dict[str, Any]:
-    """Execute the full multi-agent financial risk analysis pipeline.
+    """Run the full Q&A pipeline.
 
     Parameters
     ----------
     query :
-        The user's financial-risk question.
-    documents :
-        Pre-loaded ``Document`` objects to attach to the initial state
-        (e.g. from the ingestion layer).  These are informational; the
-        retriever pulls from the FAISS index independently.
-    thread_id :
-        Optional conversation thread ID for the ``MemorySaver``
-        checkpointer.  If ``None`` a new UUID is generated.
+        The user's question.
+    store :
+        A loaded FAISS vector store.
 
     Returns
     -------
     dict
-        The ``final_report`` dict produced by the reporter agent.
-        Returns an error dict if the pipeline fails.
+        ``{"answer": str, "sources": list, "agent_trace": list}``
     """
-    graph = _get_graph()
+    logger.info("═══ Starting Q&A pipeline for: '%.80s…' ═══", query)
 
-    # Build clean initial state.
-    state = initial_state(query)
-    if documents:
-        state["documents"] = documents
+    # Build graph with store bound via closure
+    workflow = StateGraph(QAState)
 
-    # Checkpointer config — each thread_id gets its own memory lane.
-    config = {
-        "configurable": {
-            "thread_id": thread_id or str(uuid.uuid4()),
-        }
+    workflow.add_node("retriever", _make_retriever_agent(store))
+    workflow.add_node("analyzer", analyzer_agent)
+    workflow.add_node("reporter", reporter_agent)
+
+    workflow.set_entry_point("retriever")
+    workflow.add_edge("retriever", "analyzer")
+    workflow.add_edge("analyzer", "reporter")
+    workflow.add_edge("reporter", END)
+
+    graph = workflow.compile()
+
+    # Run
+    result = graph.invoke({
+        "query": query,
+        "context": "",
+        "chunk_count": 0,
+        "analysis": "",
+        "sources": [],
+        "final_answer": "",
+        "agent_trace": [],
+    })
+
+    logger.info(
+        "═══ Pipeline complete | trace=%s ═══",
+        result.get("agent_trace", []),
+    )
+
+    return {
+        "answer": result.get("final_answer", "No answer generated."),
+        "sources": result.get("sources", []),
+        "agent_trace": result.get("agent_trace", []),
     }
-
-    # ── Optional MLflow tracking ─────────────────────────────────────
-    tracker = RiskAnalysisTracker()
-    tracker.start_run(query)
-
-    logger.info(
-        "═══════════════════════════════════════════════════════\n"
-        "  WORKFLOW START  |  query='%.120s…'\n"
-        "═══════════════════════════════════════════════════════",
-        query,
-    )
-
-    try:
-        final_state = graph.invoke(state, config=config)
-    except Exception as exc:
-        logger.exception("Workflow failed with exception: %s", exc)
-        tracker.end_run()
-        return {
-            "summary": "Analysis failed due to an internal error.",
-            "risk_level": "UNKNOWN",
-            "risk_badge": "❓ UNKNOWN",
-            "key_metrics": [],
-            "anomalies": [],
-            "justification": str(exc),
-            "recommendations": ["Investigate the error and retry."],
-            "sources": [],
-            "verification_status": False,
-            "verification_notes": [f"Pipeline error: {exc}"],
-            "agent_trace": [],
-        }
-
-    # ── Log the full agent trace ────────────────────────────────────
-    trace = final_state.get("agent_trace", [])
-    logger.info(
-        "═══════════════════════════════════════════════════════\n"
-        "  WORKFLOW COMPLETE\n"
-        "  Agent trace: %s\n"
-        "  Risk level:  %s\n"
-        "  Verified:    %s\n"
-        "═══════════════════════════════════════════════════════",
-        " → ".join(trace),
-        final_state.get("risk_level", "?"),
-        final_state.get("verified", "?"),
-    )
-
-    report = final_state.get("final_report", {})
-
-    # ── Log to MLflow ───────────────────────────────────────────────
-    tracker.log_metrics(final_state.get("financial_metrics", {}))
-    tracker.log_report(report)
-    tracker.end_run()
-
-    return report

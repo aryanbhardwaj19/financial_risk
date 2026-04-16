@@ -30,6 +30,28 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _to_native(obj):
+    """Recursively convert numpy scalar types to Python native types.
+
+    LangGraph's ``MemorySaver`` uses msgpack which cannot serialise
+    numpy scalars (``numpy.float32``, ``numpy.int64``, etc.).  This
+    helper walks dicts / lists and converts them in-place.
+    """
+    import numpy as _np
+
+    if isinstance(obj, dict):
+        return {k: _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_native(v) for v in obj]
+    if isinstance(obj, _np.integer):
+        return int(obj)
+    if isinstance(obj, _np.floating):
+        return float(obj)
+    if isinstance(obj, _np.ndarray):
+        return obj.tolist()
+    return obj
+
 # ── Regex for extracting labelled numbers ───────────────────────────
 # Matches patterns like "Total Debt: 1,234.56" or "revenue of $5.2M".
 _LABELLED_NUMBER_RE = re.compile(
@@ -333,9 +355,9 @@ def analyst_agent(state: AgentState) -> Dict[str, Any]:
     # Preserve existing metrics (like the plan) and add new data.
     metrics = dict(state.get("financial_metrics", {}))
     metrics["raw_extractions"] = {
-        k: [round(v, 4) for v in vals] for k, vals in raw_metrics.items()
+        k: [float(v) for v in vals] for k, vals in raw_metrics.items()
     }
-    metrics["ratios"] = ratios
+    metrics["ratios"] = _to_native(ratios)
 
     logger.info(
         "◀ analyst_agent EXIT   |  ratios=%d  anomalies=%d",
@@ -343,8 +365,8 @@ def analyst_agent(state: AgentState) -> Dict[str, Any]:
         len(all_anomalies),
     )
 
-    return {
+    return _to_native({
         "financial_metrics": metrics,
         "anomalies": all_anomalies,
         "agent_trace": ["analyst"],
-    }
+    })

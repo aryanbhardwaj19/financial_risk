@@ -16,11 +16,11 @@ import json
 from typing import Any, Dict
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from config import settings
 from graph.state import AgentState
 from utils.logger import get_logger
+from utils.llm_factory import get_llm
 
 logger = get_logger(__name__)
 
@@ -71,11 +71,7 @@ def planner_agent(state: AgentState) -> Dict[str, Any]:
     query: str = state["query"]
     logger.info("▶ planner_agent ENTER  |  query='%.120s…'", query)
 
-    llm = ChatOpenAI(
-        model=settings.LLM_MODEL,
-        api_key=settings.OPENAI_API_KEY,
-        temperature=0.0,
-    )
+    llm = get_llm(temperature=0.0)
 
     messages = [
         SystemMessage(content=_SYSTEM_PROMPT),
