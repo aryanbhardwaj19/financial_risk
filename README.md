@@ -4,6 +4,23 @@ FinRisk is a Streamlit application for querying financial documents (`PDF`, `CSV
 
 It ingests documents, builds a FAISS index from local sentence-transformer embeddings, and answers questions through a LangGraph pipeline with source citations.
 
+## UI Preview
+
+### 🏠 Landing Page
+<p align="center">
+  <img src="screenshots/landing.png" width="800"/>
+</p>
+
+### 📤 Upload & Indexing
+<p align="center">
+  <img src="screenshots/document.png" width="800"/>
+</p>
+
+### 📊 Financial Analysis Output
+<p align="center">
+  <img src="screenshots/rag_chat.png" width="800"/>
+</p>
+
 ## What is implemented today
 
 The **active runtime flow** (used by `app.py`) is:
